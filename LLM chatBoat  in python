@@ -1,0 +1,122 @@
+import json
+import requests
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
+from torch.utils.data import Dataset
+from logging import getLogger, StreamHandler, INFO
+
+# Set up logging
+logger = getLogger(__name__)
+handler = StreamHandler()
+handler.setLevel(INFO)
+logger.addHandler(handler)
+logger.setLevel(INFO)
+
+# Step 1: Load the Alpaca Dataset (or your custom dataset)
+url = 'https://raw.githubusercontent.com/tatsu-lab/stanford_alpaca/main/alpaca_data.json'  # Replace with your dataset URL if needed
+logger.info("Fetching dataset from URL...")
+response = requests.get(url)
+alpaca_data = response.json()
+logger.info(f"Loaded {len(alpaca_data)} samples from dataset.")
+
+# Save the dataset locally for reference (optional)
+with open('alpaca_data.json', 'w') as f:
+    json.dump(alpaca_data, f)
+logger.info("Dataset saved locally as 'alpaca_data.json'.")
+
+# Step 2: Load a model and tokenizer
+model_name = "EleutherAI/gpt-neo-1.3B"  # Choose a suitable LLM model
+logger.info(f"Loading model: {model_name}")
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+# Ensure tokenizer has a padding token defined
+if tokenizer.pad_token is None:
+    tokenizer.add_special_tokens({'pad_token': '<pad>'})
+    logger.info("Added padding token '<pad>' to tokenizer.")
+
+model = AutoModelForCausalLM.from_pretrained(model_name)
+logger.info("Model loaded successfully.")
+
+# Step 3: Preprocess the Dataset
+def preprocess(data):
+    try:
+        if 'instruction' in data and 'response' in data:
+            # Consider handling potential data cleaning or normalization here (e.g., lowercase conversion)
+            instruction = data['instruction']
+            response = data['response']
+            inputs = tokenizer(instruction, return_tensors='pt', truncation=True, padding='max_length', max_length=128)
+            labels = tokenizer(response, return_tensors='pt', truncation=True, padding='max_length', max_length=128)['input_ids']
+            return inputs.input_ids.squeeze(0), labels.squeeze(0)
+        else:
+            logger.warning(f"Skipping invalid data (missing 'instruction' or 'response'): {data}")
+            return None, None
+    except Exception as e:
+        logger.error(f"Error processing data: {data}\nError: {e}")
+        return None, None
+
+# Preprocess and filter out invalid samples
+logger.info("Preprocessing dataset...")
+train_data = []
+for idx, sample in enumerate(alpaca_data):
+    input_ids, labels = preprocess(sample)
+    if input_ids is not None and labels is not None:
+        train_data.append((input_ids, labels))
+    else:
+        logger.warning(f"Invalid sample at index {idx}: {sample}")
+
+logger.info(f"Filtered down to {len(train_data)} valid training samples.")
+
+# Check if there are any valid training examples
+if len(train_data) == 0:
+    # Print first few samples for debugging
+    logger.error("No valid training examples found. Please check your dataset preprocessing.")
+    logger.info("First few samples:")
+    for sample in alpaca_data[:5]:
+        print(sample)
+    raise ValueError("No valid training examples found. Please check your dataset preprocessing.")
+
+# Step 4: Define Training Arguments
+training_args = TrainingArguments(
+    output_dir='./results',
+    num_train_epochs=3,  # Adjust based on dataset size and desired accuracy
+    per_device_train_batch_size=4,  # Adjust based on your GPU memory capacity
+    warmup_steps=500,
+    weight_decay=0.01,
+    logging_dir='./logs',
+    logging_steps=10,
+    dataloader_num_workers=4,  # Increase if preprocessing speed is an issue
+    evaluation_strategy="epoch",  # Evaluate after each epoch
+)
+
+# Step 5: Create Custom Dataset Class
+class CustomDataset(Dataset):
+    def __init__(self, data):
+        self.data = data
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return self.data[idx]
+
+# Convert train_data to CustomDataset
+train_dataset = CustomDataset(train_data)
+
+# Step 6: Define Data Collator
+def data_collator(features):
+    input_ids = torch.stack([f[0] for f in features])
+    labels = torch.stack([f[1] for f in features])
+    return {"input_ids": input_ids, "labels": labels}
+
+# Step 7: Initialize Trainer
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    data_collator=data_collator,
+)
+
+# Step 8: Train the model
+logger.info("Starting training...")
+trainer.train()
+logger.info("Training completed.")
